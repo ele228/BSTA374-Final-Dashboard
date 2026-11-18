@@ -1,0 +1,277 @@
+---
+title: "Suicide mortality in Indiana counties, 2018-2024"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: cosmo
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# One-time install (run in the console, not in this document):
+# install.packages(c("flexdashboard","shiny","sf","dplyr","stringr","readr",
+#                    "readxl","ggplot2","plotly","leaflet","DT","tigris",
+#                    "RColorBrewer"))
+
+library(flexdashboard)
+library(shiny)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(leaflet)
+library(DT)
+library(tigris)
+options(tigris_use_cache = TRUE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# ---- 1. File locations: edit these if your files are named/placed differently
+FILE_YEARS  <- "data/IN Suicide Rates Years.xlsx"    # county x year
+FILE_POOLED <- "data/IN Suicide Rates Pooled.xlsx"   # county, 2018-2024 pooled
+
+VIEW_ANNUAL <- "Annual data (choose years)"
+VIEW_POOLED <- "Pooled 2018-2024"
+
+# ---- 2. Reader for CDC WONDER exports
+# WONDER's ".xls" is usually tab-delimited text with the extension changed.
+# This reads either a true Excel file or a tab-delimited file, all as text.
+read_wonder <- function(path, need) {
+  if (!file.exists(path)) {
+    stop("Cannot find '", path, "'. Put the file in a 'data' folder next to ",
+         "this .Rmd, or edit FILE_YEARS / FILE_POOLED in the setup chunk.")
+  }
+  magic <- readBin(path, "raw", n = 4)
+  is_excel <- identical(magic[1:2], as.raw(c(0xD0, 0xCF))) ||   # old .xls
+              identical(magic[1:2], as.raw(c(0x50, 0x4B)))      # .xlsx
+  df <- if (is_excel) {
+    readxl::read_excel(path, col_types = "text")
+  } else {
+    suppressWarnings(readr::read_tsv(path, col_types = cols(.default = col_character()),
+                                     progress = FALSE))
+  }
+  names(df) <- str_trim(names(df))
+  miss <- setdiff(need, names(df))
+  if (length(miss)) {
+    stop("'", path, "' is missing expected column(s): ", paste(miss, collapse = ", "),
+         ". Columns found: ", paste(names(df), collapse = ", "))
+  }
+  if (!"Notes" %in% names(df)) df$Notes <- NA_character_
+  df$Notes <- coalesce(df$Notes, "")
+  df
+}
+
+to_num <- function(x) suppressWarnings(as.numeric(str_replace_all(x, ",", "")))
+
+# ---- 3. Pooled file: one row per county; keep the "Total" row for the reference rate
+pooled_raw <- read_wonder(FILE_POOLED, c("County Code", "Deaths", "Population"))
+
+pooled <- pooled_raw |>
+  filter(!is.na(`County Code`), Notes != "Total") |>
+  transmute(fips   = str_pad(str_trim(`County Code`), 5, pad = "0"),
+            deaths = to_num(Deaths),            # "Suppressed" becomes NA
+            pop    = to_num(Population))
+
+# Indiana reference rate (deaths per person-year, 2018-2024), used to compute
+# expected counts. Best source: the WONDER "Total" row, which includes
+# suppressed counties.
+tot <- pooled_raw |> filter(Notes == "Total", is.na(`County Code`))
+if (nrow(tot) > 0) {
+  ref_rate <- to_num(tot$Deaths[1]) / to_num(tot$Population[1])
+  ref_note <- "Reference: Indiana 2018-2024 crude rate (from the WONDER total row)."
+} else {
+  ok <- !is.na(pooled$deaths)
+  ref_rate <- sum(pooled$deaths[ok]) / sum(pooled$pop[ok])
+  ref_note <- paste("Reference: Indiana crude rate from non-suppressed counties only",
+                    "(re-export with 'Show Totals' for the exact statewide rate).")
+}
+
+# ---- 4. Annual file: one row per county and year
+yrs_raw <- read_wonder(FILE_YEARS, c("County Code", "Year", "Deaths", "Population"))
+
+yrs <- yrs_raw |>
+  filter(!is.na(`County Code`), !is.na(Year), Notes != "Total") |>
+  transmute(fips   = str_pad(str_trim(`County Code`), 5, pad = "0"),
+            year   = as.integer(str_extract(Year, "\\d{4}")),
+            deaths = to_num(Deaths),
+            pop    = to_num(Population))
+
+# ---- 5. County boundaries (Census, via tigris)
+in_map <- counties(state = "IN", cb = TRUE, year = 2020, progress_bar = FALSE) |>
+  st_transform(4326) |>
+  select(GEOID, NAME)
+
+county_choices <- setNames(in_map$GEOID, in_map$NAME)
+county_choices <- county_choices[order(names(county_choices))]
+county_names   <- st_drop_geometry(in_map)
+
+# WONDER leaves out county-years with 1-9 deaths instead of marking them, so
+# an absent row means "suppressed". Rebuild the full county x year grid so
+# those gaps are explicit (deaths = NA) rather than silently ignored.
+yr_range <- range(yrs$year)
+yrs <- yrs |>
+  complete(fips = in_map$GEOID, year = seq(yr_range[1], yr_range[2]))
+pct_observed <- round(100 * mean(!is.na(yrs$deaths)))
+
+# Same SIR classes as the course example (Exercise 4)
+sir_breaks <- c(0, 0.5, 2/3, 0.9, 1/0.9, 1.5, 2, Inf)
+```
+
+Column {.sidebar data-width=200}
+-----------------------------------------------------------------------
+
+```{r inputs}
+radioButtons("view", "Data view",
+             choices = c(VIEW_ANNUAL, VIEW_POOLED), selected = VIEW_ANNUAL)
+
+selectInput("county", "County to highlight",
+            choices = county_choices, selected = "18097")  # Marion
+
+conditionalPanel(
+  condition = sprintf("input.view == '%s'", VIEW_ANNUAL),
+  sliderInput("years", "Years",
+              min = min(yrs$year), max = max(yrs$year),
+              value = range(yrs$year), step = 1, sep = "")
+)
+```
+
+Choose a view, a county, and (for annual data) a range of years. The map,
+time series and table update together.
+
+**Grey counties** have no estimate: CDC WONDER withholds death counts of 1-9,
+so a county is grey if its count is suppressed. In the annual view, a county is
+grey if *any* selected year is suppressed; widen the year range or switch to
+the pooled view to see more counties.
+
+```{r refnote, results='asis'}
+cat(sprintf(paste0("<small>%s Rate = %.1f per 100,000 person-years. ",
+                   "Only %d%% of county-years have a reported count.</small>"),
+            ref_note, ref_rate * 1e5, pct_observed))
+```
+
+```{r reactive}
+# Observed, expected and SIR by county, for the chosen view
+by_county <- reactive({
+  req(input$view)
+  d <- if (input$view == VIEW_POOLED) {
+    pooled |> transmute(GEOID = fips, Y = deaths, Pop = pop,
+                        n_supp = as.integer(is.na(deaths)))
+  } else {
+    req(input$years)
+    yrs |>
+      filter(between(year, input$years[1], input$years[2])) |>
+      group_by(GEOID = fips) |>
+      summarise(n_supp = sum(is.na(deaths)),
+                Y   = if (n_supp > 0) NA_real_ else sum(deaths),
+                Pop = sum(pop, na.rm = TRUE),
+                .groups = "drop")
+  }
+  d |> mutate(E = Pop * ref_rate, SIR = Y / E)
+})
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### SIR by county (black outline: selected county)
+
+```{r map}
+renderLeaflet({
+  d <- left_join(in_map, by_county(), by = "GEOID") |>
+    mutate(label = ifelse(is.na(SIR),
+                          sprintf("%s: not shown (suppressed or missing)", NAME),
+                          sprintf("%s: SIR %.2f (%.0f observed, %.1f expected)",
+                                  NAME, SIR, Y, E)))
+  
+  bb <- st_bbox(in_map)
+
+  pal <- colorBin(rev(RColorBrewer::brewer.pal(7, "RdBu")),
+                  domain = c(0, 1000), bins = sir_breaks, na.color = "#BDBDBD")
+
+  title <- if (input$view == VIEW_POOLED) "SIR<br>2018-2024"
+           else paste0("SIR<br>", input$years[1], "-", input$years[2])
+
+  leaflet(d) |>
+    addProviderTiles(providers$Esri.WorldGrayCanvas) |>
+fitBounds(bb[["xmin"]], bb[["ymin"]], bb[["xmax"]], bb[["ymax"]]) |>
+    addPolygons(
+      fillColor = ~pal(SIR), fillOpacity = 0.85,
+      color = "white", weight = 1, label = ~label,
+      highlightOptions = highlightOptions(weight = 2, color = "black",
+                                          bringToFront = TRUE)
+    ) |>
+    addPolygons(data = filter(d, GEOID == input$county),   # selected county
+                fill = FALSE, color = "black", weight = 3) |>
+    addLegend("bottomright", pal = pal, values = ~SIR, title = title,
+              na.label = "Suppressed / missing",
+              labFormat = labelFormat(digits = 2), opacity = 0.85)
+})
+```
+
+> SIR = observed / expected suicide deaths, where expected is each county's
+> population times the Indiana 2018-2024 rate. Red: more deaths than
+> expected; blue: fewer. This is a *crude* ratio (not age-adjusted), and
+> small counties are unstable even when not suppressed. Source: CDC WONDER,
+> Underlying Cause of Death 2018-2024 (ICD-10 X60-X84, Y87.0). Boundaries:
+> US Census Bureau via `tigris`.
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### SIR by year, selected county (grey band: selected years; dashed line: Indiana rate) {data-height=330}
+
+```{r timeseries}
+renderPlotly({
+  one <- yrs |>
+    filter(fips == input$county) |>
+    mutate(E = pop * ref_rate, SIR = deaths / E,
+           txt = ifelse(is.na(deaths),
+                        paste0(year, ": suppressed (1-9 deaths)"),
+                        sprintf("%d: SIR %.2f (%.0f deaths)", year, SIR, deaths)))
+
+  validate(need(any(!is.na(one$SIR)),
+                "Every year is suppressed for this county. Try the pooled view."))
+
+  p <- ggplot(one, aes(year, SIR)) +
+    geom_hline(yintercept = 1, linetype = 2, colour = "grey50") +
+    geom_line(aes(group = 1), colour = "#B2182B", linewidth = 0.8) +
+    geom_point(aes(text = txt), colour = "#B2182B", size = 2) +
+    scale_x_continuous(breaks = sort(unique(yrs$year))) +
+    expand_limits(y = 0) +
+    labs(x = NULL, y = "SIR (vs Indiana 2018-2024 rate)") +
+    theme_minimal()
+
+  if (!is.null(input$view) && input$view == VIEW_ANNUAL && !is.null(input$years)) {
+    p <- p + annotate("rect", xmin = input$years[1] - 0.5, xmax = input$years[2] + 0.5,
+                      ymin = -Inf, ymax = Inf, fill = "grey80", alpha = 0.4)
+  }
+
+  ggplotly(p, tooltip = "text")
+})
+```
+
+> Gaps in the line are years where the county's death count was suppressed (1-9 deaths).
+
+### Counties, selected view {data-height =670}
+
+```{r table}
+renderDT({
+  sel <- county_names$NAME[county_names$GEOID == input$county]
+
+  by_county() |>
+    left_join(county_names, by = "GEOID") |>
+    transmute(County   = NAME,
+              Observed = ifelse(is.na(Y), "Suppressed", as.character(Y)),
+              Expected = round(E, 1),
+              SIR      = round(SIR, 2)) |>
+    arrange(desc(SIR)) |>
+    datatable(rownames = FALSE, options = list(pageLength = 10, scrollx=TRUE)) |>
+    formatStyle("County", target = "row",
+                fontWeight = styleEqual(sel, "bold"))
+})
+```
